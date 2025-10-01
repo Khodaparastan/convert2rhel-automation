@@ -22,6 +22,7 @@ conversion-logs/
 *.tfstate.*
 *.tfvars
 .terraform/
+**/.terraform/
 crash.log
 crash.*.log
 # Lock files for examples can be committed for reproducibility

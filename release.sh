@@ -200,8 +200,15 @@ check_security() {
     )
 
     local found_issues=0
+    local exclude_dirs=(".git" ".terraform" ".idea" ".vscode" "node_modules")
+    local exclude_args=()
+
+    for dir in "${exclude_dirs[@]}"; do
+        exclude_args+=("--exclude-dir=$dir")
+    done
+
     for pattern in "${security_patterns[@]}"; do
-        if grep -rniE "$pattern" . --exclude-dir=.git --exclude="release.sh" --exclude="*.md" 2>/dev/null; then
+        if grep -rniE "$pattern" . "${exclude_args[@]}" --exclude="release.sh" --exclude="*.md" --binary-files=without-match 2>/dev/null; then
             log_error "Found potential hardcoded credentials matching: $pattern"
             ((found_issues++)) || true
         fi
