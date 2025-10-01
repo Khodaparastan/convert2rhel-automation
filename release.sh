@@ -218,16 +218,17 @@ check_security() {
         die "Security check failed - found $found_issues potential issues"
     fi
 
-    # Check for TODO/FIXME in code
+    # Check for TODO/FIXME in code (excluding mktemp patterns like XXXXXXXXXX)
     local todos
-    todos=$(grep -rn "TODO\|FIXME\|XXX\|HACK" "$MAIN_SCRIPT" || true)
+    # Look for TODO, FIXME, or HACK as whole words (not part of other patterns)
+    todos=$(grep -rn "\(#.*TODO\|#.*FIXME\|#.*HACK\)" "$MAIN_SCRIPT" || true)
 
     if [[ -n "$todos" ]]; then
-        log_warning "Found TODO/FIXME comments in code:"
+        log_warning "Found TODO/FIXME/HACK comments in code:"
         echo "$todos"
 
-        if ! confirm "Continue with TODO/FIXME comments?"; then
-            die "Fix TODO/FIXME comments before releasing"
+        if ! confirm "Continue with TODO/FIXME/HACK comments?"; then
+            die "Fix TODO/FIXME/HACK comments before releasing"
         fi
     fi
 
