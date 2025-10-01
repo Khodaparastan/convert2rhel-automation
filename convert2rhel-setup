@@ -1,0 +1,1255 @@
+#!/usr/bin/env bash
+#
+# convert2rhel-setup
+# Automated setup script for converting to Red Hat Enterprise Linux
+# https://github.com/khodaparastan/convert2rhel-automation
+# Version: 1.3.0
+# Last Updated: 2025-10-01
+# Maintained By: Khodaparastan
+#
+# Usage: ./convert2rhel-setup [OPTIONS]
+# Options:
+#   -o, --org-id <ID>          Red Hat organization ID
+#   -k, --activation-key <KEY> Red Hat activation key
+#   -a, --analyze-only         Run analysis only without conversion
+#   -s, --skip-analysis        Skip analysis and proceed directly to conversion
+#   -y, --assume-yes           Skip all confirmation prompts
+#   -v, --verbose              Show verbose output from package manager commands
+#   --skip-base-packages       Skip installation of base utility packages
+#   -h, --help                 Display this help message
+#
+# Environment Variables:
+#   RH_ORG_ID          Red Hat organization ID
+#   RH_ACTIVATION_KEY  Red Hat activation key
+#   LOG_FILE           Custom log file path (default: /var/log/convert2rhel-setup.log)
+#   SKIP_BASE_PKGS     Skip base package installation (true/false)
+#
+# Exit Codes:
+#   0   - Success
+#   1   - General error
+#   2   - Invalid arguments
+#   3   - Prerequisites not met
+#   4   - Analysis failed
+#   5   - Conversion failed
+
+set -o errexit  # Exit on error
+set -o nounset  # Exit on undefined variable
+set -o pipefail # Exit on pipe failure
+
+# ============================================================================
+# Constants and Configuration
+# ============================================================================
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly SCRIPT_VERSION="1.3.0"
+readonly LOG_FILE="${LOG_FILE:-/var/log/convert2rhel-setup.log}"
+readonly GPG_KEY_URL="https://security.access.redhat.com/data/fd431d51.txt"
+readonly GPG_KEY_PATH="/etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release"
+readonly CONVERT2RHEL_CONFIG="/etc/convert2rhel.ini"
+readonly MIN_FREE_SPACE_GB=5
+readonly MASK_VISIBLE_CHARS=4
+readonly CONNECTION_TIMEOUT=10
+readonly CONNECTION_MAX_TIME=20
+
+# Connectivity check endpoints (critical for conversion process)
+readonly CONNECTIVITY_ENDPOINTS=(
+    "https://redhat.com"
+    "https://cdn-public.redhat.com"
+    "https://subscription.rhsm.redhat.com"
+)
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly EXIT_INVALID_ARGS=2
+readonly EXIT_PREREQ_FAILED=3
+readonly EXIT_ANALYSIS_FAILED=4
+readonly EXIT_CONVERSION_FAILED=5
+
+# Required commands
+readonly REQUIRED_COMMANDS=("curl" "awk" "sed" "grep" "date" "df")
+
+# ============================================================================
+# Terminal Colors Setup
+# ============================================================================
+
+# Function to check if terminal supports colors
+supports_colors() {
+    # Check if stdout is a terminal
+    [[ -t 1 ]] || return 1
+
+    # Check if tput is available
+    command -v tput &>/dev/null || return 1
+
+    # Check if terminal supports colors
+    local colors
+    colors="$(tput colors 2>/dev/null)" || return 1
+    [[ -n "${colors}" && "${colors}" -ge 8 ]] || return 1
+
+    return 0
+}
+
+# Initialize color variables with fallback values
+if supports_colors; then
+    RED="$(tput setaf 1 2>/dev/null || printf '\033[0;31m')"
+    GREEN="$(tput setaf 2 2>/dev/null || printf '\033[0;32m')"
+    YELLOW="$(tput setaf 3 2>/dev/null || printf '\033[1;33m')"
+    BLUE="$(tput setaf 4 2>/dev/null || printf '\033[0;34m')"
+    BOLD="$(tput bold 2>/dev/null || printf '\033[1m')"
+    NC="$(tput sgr0 2>/dev/null || printf '\033[0m')"
+    readonly RED GREEN YELLOW BLUE BOLD NC
+else
+    readonly RED=""
+    readonly GREEN=""
+    readonly YELLOW=""
+    readonly BLUE=""
+    readonly BOLD=""
+    readonly NC=""
+fi
+
+# ============================================================================
+# Global Variables
+# ============================================================================
+
+# Script state variables
+RHEL_VERSION=""
+ORG_ID="${RH_ORG_ID:-}"
+ACTIVATION_KEY="${RH_ACTIVATION_KEY:-}"
+ANALYZE_ONLY=false
+SKIP_ANALYSIS=false
+ASSUME_YES=false
+VERBOSE=false
+SKIP_BASE_PACKAGES="${SKIP_BASE_PKGS:-false}"
+PACKAGE_MANAGER=""
+TEMP_DIR=""
+
+# ============================================================================
+# Cleanup and Signal Handling
+# ============================================================================
+
+# Cleanup function for temporary files and resources
+# shellcheck disable=SC2329
+cleanup() {
+    local exit_code=$?
+
+    if [[ -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+        rm -rf "${TEMP_DIR}" 2>/dev/null || {
+            printf 'Warning: Failed to remove temporary directory: %s\n' "${TEMP_DIR}" >&2
+        }
+    fi
+
+    return "${exit_code}"
+}
+
+# Signal handler for interrupts
+# shellcheck disable=SC2329
+handle_interrupt() {
+    local signal="$1"
+    printf '\n%bReceived signal %s, cleaning up...%b\n' "${YELLOW}" "${signal}" "${NC}" >&2
+    exit 130
+}
+
+# Signal handler for termination
+# shellcheck disable=SC2329
+handle_termination() {
+    printf '\n%bReceived termination signal, cleaning up...%b\n' "${YELLOW}" "${NC}" >&2
+    exit 143
+}
+
+# Setup cleanup trap for all exit scenarios
+trap cleanup EXIT
+trap 'handle_interrupt INT' INT
+trap 'handle_termination' TERM
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Strip ANSI/terminal escape sequences from text
+strip_colors() {
+    local input="${1:-}"
+    printf '%s' "${input}" | sed -E 's/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGKHJsu]//g'
+}
+
+# Log message with timestamp to file only
+log_to_file() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '[%s] [%s] %s\n' "${timestamp}" "${level}" "${message}" >>"${LOG_FILE}"
+}
+
+# Log info message
+log_info() {
+    local message="$*"
+    printf '%b[INFO]%b %s\n' "${BLUE}" "${NC}" "${message}"
+    log_to_file "INFO" "$(strip_colors "${message}")"
+}
+
+# Log success message
+log_success() {
+    local message="$*"
+    printf '%b[SUCCESS]%b %s\n' "${GREEN}" "${NC}" "${message}"
+    log_to_file "SUCCESS" "$(strip_colors "${message}")"
+}
+
+# Log warning message
+log_warning() {
+    local message="$*"
+    printf '%b[WARNING]%b %s\n' "${YELLOW}" "${NC}" "${message}"
+    log_to_file "WARNING" "$(strip_colors "${message}")"
+}
+
+# Log error message to stderr
+log_error() {
+    local message="$*"
+    printf '%b[ERROR]%b %s\n' "${RED}" "${NC}" "${message}" >&2
+    log_to_file "ERROR" "$(strip_colors "${message}")"
+}
+
+# Exit with error message and code
+die() {
+    local exit_code="${EXIT_ERROR}"
+    local message=""
+
+    # Support optional exit code as first argument
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        exit_code="$1"
+        shift
+    fi
+
+    message="$*"
+    log_error "${message}"
+    exit "${exit_code}"
+}
+
+# Mask sensitive data for logging (show first N chars, mask rest)
+mask_sensitive() {
+    local value="$1"
+    local visible_chars="${2:-${MASK_VISIBLE_CHARS}}"
+    local value_length="${#value}"
+
+    # Validate input
+    if [[ -z "${value}" ]]; then
+        printf '(empty)'
+        return
+    fi
+
+    if [[ ${value_length} -le ${visible_chars} ]]; then
+        printf '%*s' "${value_length}" '' | tr ' ' '*'
+        return
+    fi
+
+    local masked_length=$((value_length - visible_chars))
+    printf '%s' "${value:0:${visible_chars}}"
+    printf '%*s' "${masked_length}" '' | tr ' ' '*'
+}
+
+# Print log section header
+log_section_header() {
+    local title="$1"
+    local separator="========================================="
+
+    log_info "${separator}"
+    log_info "${title}"
+    log_info "${separator}"
+}
+
+# Print usage information
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} version ${SCRIPT_VERSION}
+
+Automated setup script for converting to Red Hat Enterprise Linux
+
+${BOLD}Usage:${NC} ${SCRIPT_NAME} [OPTIONS]
+
+${BOLD}Options:${NC}
+    -o, --org-id <ID>          Red Hat organization ID
+    -k, --activation-key <KEY> Red Hat activation key
+    -a, --analyze-only         Run analysis only without conversion
+    -s, --skip-analysis        Skip analysis and proceed directly to conversion
+    -y, --assume-yes           Skip all confirmation prompts
+    -v, --verbose              Show verbose output from package manager commands
+    --skip-base-packages       Skip installation of base utility packages
+    -h, --help                 Display this help message
+
+${BOLD}Environment Variables:${NC}
+    RH_ORG_ID          Red Hat organization ID
+    RH_ACTIVATION_KEY  Red Hat activation key
+    LOG_FILE           Custom log file path (default: ${LOG_FILE})
+    SKIP_BASE_PKGS     Skip base package installation (true/false)
+
+${BOLD}Examples:${NC}
+    # Run analysis only
+    ${SCRIPT_NAME} --org-id 123456 --activation-key mykey --analyze-only
+
+    # Full conversion with analysis
+    ${SCRIPT_NAME} --org-id 123456 --activation-key mykey
+
+    # Skip analysis, go directly to conversion
+    ${SCRIPT_NAME} --org-id 123456 --activation-key mykey --skip-analysis
+
+    # Unattended conversion without analysis
+    ${SCRIPT_NAME} -o 123456 -k mykey -s -y
+
+${BOLD}Exit Codes:${NC}
+    0 - Success
+    1 - General error
+    2 - Invalid arguments
+    3 - Prerequisites not met
+    4 - Analysis failed
+    5 - Conversion failed
+
+${BOLD}Quick Command Reference:${NC}
+    # Safe: Analysis first (recommended)
+    sudo ./${SCRIPT_NAME} -o 123456 -k mykey -a
+
+    # Interactive: With prompts
+    sudo ./${SCRIPT_NAME} -o 123456 -k mykey
+
+    # Automated: No prompts
+    sudo ./${SCRIPT_NAME} -o 123456 -k mykey -y
+
+${BOLD}Documentation:${NC}
+    Repository:          https://github.com/khodaparastan/convert2rhel-automation
+    Full documentation:  https://github.com/khodaparastan/convert2rhel-automation/blob/main/README.md
+    Quick reference:     https://github.com/khodaparastan/convert2rhel-automation/blob/main/QUICK_REFERENCE.md
+    Log files:           /var/log/convert2rhel-setup*.log
+
+${BOLD}Support:${NC}
+    Red Hat Docs:        https://access.redhat.com/documentation/
+    Support Portal:      https://access.redhat.com/support
+    Activation Keys:     https://console.redhat.com/insights/connector/activation-keys
+
+EOF
+}
+
+confirm() {
+    local prompt="$1"
+    local response
+
+    if [[ "${ASSUME_YES}" == true ]]; then
+        log_info "Auto-confirming: ${prompt}"
+        return 0
+    fi
+
+    while true; do
+        printf '%s [y/N]: ' "${prompt}"
+
+        # Handle EOF gracefully
+        if ! read -r response; then
+            printf '\n'
+            log_warning "EOF detected, treating as 'no'"
+            return 1
+        fi
+
+        case "${response,,}" in
+            y|yes)
+                return 0
+                ;;
+            n|no|"")
+                return 1
+                ;;
+            *)
+                printf 'Please answer yes or no.\n'
+                ;;
+        esac
+    done
+}
+
+# Check if command exists
+command_exists() {
+    command -v "$1" &>/dev/null
+}
+
+# Verify required commands are available
+check_required_commands() {
+    local missing_commands=()
+    local cmd
+
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        if ! command_exists "${cmd}"; then
+            missing_commands+=("${cmd}")
+        fi
+    done
+
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        die "${EXIT_PREREQ_FAILED}" "Missing required commands: ${missing_commands[*]}"
+    fi
+}
+
+# ============================================================================
+# Validation Functions
+# ============================================================================
+
+# Check if running as root
+check_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "${EXIT_PREREQ_FAILED}" "This script must be run as root"
+    fi
+}
+
+# Detect system architecture
+detect_architecture() {
+    local arch
+    arch="$(uname -m)"
+
+    case "${arch}" in
+        x86_64|amd64)
+            printf "x86_64"
+            ;;
+        aarch64|arm64)
+            printf "aarch64"
+            ;;
+        *)
+            die "${EXIT_PREREQ_FAILED}" "Unsupported architecture: ${arch} (supported: x86_64, aarch64)"
+            ;;
+    esac
+}
+
+# Detect and set package manager
+detect_package_manager() {
+    if [[ -n "${PACKAGE_MANAGER}" ]]; then
+        return 0
+    fi
+
+    log_info "Detecting package manager..."
+
+    if command_exists dnf; then
+        PACKAGE_MANAGER="dnf"
+    elif command_exists yum; then
+        PACKAGE_MANAGER="yum"
+    else
+        die "${EXIT_PREREQ_FAILED}" "Neither dnf nor yum package manager found"
+    fi
+
+    log_success "Detected package manager: ${PACKAGE_MANAGER}"
+}
+
+# Detect RHEL/compatible version
+detect_rhel_version() {
+    local version_id
+    local os_release="/etc/os-release"
+
+    log_info "Detecting OS version..."
+
+    if [[ ! -f "${os_release}" ]]; then
+        die "${EXIT_PREREQ_FAILED}" "Cannot detect OS version: ${os_release} not found"
+    fi
+
+    if ! version_id=$(grep -E '^VERSION_ID=' "${os_release}" | cut -d= -f2 | tr -d '"' | tr -d "'"); then
+        die "${EXIT_PREREQ_FAILED}" "Failed to parse VERSION_ID from ${os_release}"
+    fi
+
+    if [[ -z "${version_id}" ]]; then
+        die "${EXIT_PREREQ_FAILED}" "Cannot extract VERSION_ID from ${os_release}"
+    fi
+
+    # Extract major version
+    RHEL_VERSION="${version_id%%.*}"
+
+    # Validate supported version
+    if [[ ! "${RHEL_VERSION}" =~ ^[7-9]$ ]]; then
+        die "${EXIT_PREREQ_FAILED}" "Unsupported RHEL version: ${version_id} (supported: 7, 8, 9)"
+    fi
+
+    log_success "Detected RHEL-compatible version: ${version_id} (major: ${RHEL_VERSION})"
+}
+
+# Validate required parameters
+validate_parameters() {
+    local errors=()
+
+    log_info "Validating parameters..."
+
+    # Validate Organization ID
+    if [[ -z "${ORG_ID}" ]]; then
+        errors+=("Organization ID is required (use -o or set RH_ORG_ID)")
+    elif [[ ! "${ORG_ID}" =~ ^[0-9]+$ ]]; then
+        errors+=("Organization ID must be numeric: ${ORG_ID}")
+    fi
+
+    # Validate Activation Key
+    if [[ -z "${ACTIVATION_KEY}" ]]; then
+        errors+=("Activation key is required (use -k or set RH_ACTIVATION_KEY)")
+    elif [[ ${#ACTIVATION_KEY} -lt 4 ]]; then
+        errors+=("Activation key appears too short (minimum 4 characters)")
+    fi
+
+    # Report all errors at once
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        log_error "Parameter validation failed:"
+        printf '  - %s\n' "${errors[@]}" >&2
+        exit "${EXIT_INVALID_ARGS}"
+    fi
+
+    log_info "Organization ID: ${ORG_ID}"
+    log_info "Activation Key: $(mask_sensitive "${ACTIVATION_KEY}")"
+    log_success "Parameter validation passed"
+}
+
+# Validate flag combinations
+validate_flags() {
+    if [[ "${ANALYZE_ONLY}" == true && "${SKIP_ANALYSIS}" == true ]]; then
+        die "${EXIT_INVALID_ARGS}" "Conflicting flags: cannot use --analyze-only and --skip-analysis together"
+    fi
+}
+
+# Check internet connectivity to required Red Hat endpoints
+check_connectivity() {
+    local endpoint
+    local failed=0
+    local total="${#CONNECTIVITY_ENDPOINTS[@]}"
+
+    log_info "Checking connectivity to Red Hat endpoints..."
+
+    for endpoint in "${CONNECTIVITY_ENDPOINTS[@]}"; do
+        if ! curl -fsSL --head --connect-timeout "${CONNECTION_TIMEOUT}" \
+            --max-time "${CONNECTION_MAX_TIME}" "${endpoint}" >/dev/null 2>&1; then
+            log_warning "Cannot reach: ${endpoint}"
+            ((failed++)) || true
+        else
+            log_success "Connected to: ${endpoint}"
+        fi
+    done
+
+    if [[ ${failed} -eq ${total} ]]; then
+        die "${EXIT_PREREQ_FAILED}" "No connectivity to any Red Hat endpoints detected"
+    fi
+
+    if [[ ${failed} -gt 0 ]]; then
+        log_warning "${failed} of ${total} endpoints unreachable (may cause issues during conversion)"
+        log_warning "Ensure the following are accessible: subscription.rhsm.redhat.com, cdn-public.redhat.com"
+    else
+        log_success "All ${total} Red Hat endpoints are reachable"
+    fi
+}
+
+# Check available disk space on root filesystem
+check_disk_space() {
+    local root_available_gb
+
+    log_info "Checking available disk space..."
+
+    # Get available space in GB, removing 'G' suffix
+    if ! root_available_gb=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G$//'); then
+        log_warning "Failed to determine available disk space, proceeding with caution"
+        return 0
+    fi
+
+    if [[ ! "${root_available_gb}" =~ ^[0-9]+$ ]]; then
+        log_warning "Unable to parse available disk space, proceeding with caution"
+        return 0
+    fi
+
+    if [[ ${root_available_gb} -lt ${MIN_FREE_SPACE_GB} ]]; then
+        die "${EXIT_PREREQ_FAILED}" \
+            "Insufficient disk space: ${root_available_gb}GB available, ${MIN_FREE_SPACE_GB}GB required"
+    fi
+
+    log_success "Disk space check passed: ${root_available_gb}GB available"
+}
+
+setup_logging() {
+    local log_dir
+
+    log_dir="$(dirname "${LOG_FILE}")"
+
+    # Create log directory if it doesn't exist
+    if [[ ! -d "${log_dir}" ]]; then
+        if ! mkdir -p "${log_dir}" 2>/dev/null; then
+            die "${EXIT_ERROR}" "Failed to create log directory: ${log_dir}"
+        fi
+    fi
+
+    # Test log file writability
+    if ! touch "${LOG_FILE}" 2>/dev/null; then
+        die "${EXIT_ERROR}" "Cannot write to log file: ${LOG_FILE}"
+    fi
+
+    # Set secure permissions
+    chmod 600 "${LOG_FILE}" 2>/dev/null || true
+
+    # Log initial message
+    printf '\n===========================================\n' >>"${LOG_FILE}"
+    log_to_file "SYSTEM" "Script started: ${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    log_to_file "SYSTEM" "Timestamp: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf '===========================================\n\n' >>"${LOG_FILE}"
+}
+
+# Create secure temporary directory
+setup_temp_directory() {
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+
+    if ! TEMP_DIR=$(mktemp -d -t "convert2rhel-setup.XXXXXXXXXX" 2>/dev/null); then
+        umask "${old_umask}"
+        die "${EXIT_ERROR}" "Failed to create temporary directory"
+    fi
+
+    umask "${old_umask}"
+
+    chmod 700 "${TEMP_DIR}" 2>/dev/null || {
+        die "${EXIT_ERROR}" "Failed to set permissions on temporary directory"
+    }
+
+    log_info "Created temporary directory: ${TEMP_DIR}"
+}
+
+# ============================================================================
+# Installation Functions
+# ============================================================================
+
+# Install base utility packages
+install_base_packages() {
+    local packages=("tmux" "vim" "wget" "curl" "sos")
+    local failed_packages=()
+    local pkg
+    local exit_code
+
+    # Check if base packages should be skipped
+    if [[ "${SKIP_BASE_PACKAGES}" == "true" ]]; then
+        log_info "Skipping base package installation (--skip-base-packages flag set)"
+        return 0
+    fi
+
+    log_info "Installing base utility packages: ${packages[*]}"
+
+    # Determine output redirection based on verbose flag
+    if [[ "${VERBOSE}" == true ]]; then
+        log_info "Running in verbose mode (showing package manager output)"
+    fi
+
+    # Update package cache
+    log_info "Updating package cache..."
+    if [[ "${VERBOSE}" == true ]]; then
+        if ! "${PACKAGE_MANAGER}" makecache 2>&1 | tee -a "${LOG_FILE}"; then
+            log_warning "Failed to update package cache, continuing..."
+        fi
+    else
+        if ! "${PACKAGE_MANAGER}" makecache -q >>"${LOG_FILE}" 2>&1; then
+            log_warning "Failed to update package cache, continuing..."
+        fi
+    fi
+
+    # Install packages individually
+    for pkg in "${packages[@]}"; do
+        log_info "Installing: ${pkg}..."
+
+        if [[ "${VERBOSE}" == true ]]; then
+            set +o errexit
+            "${PACKAGE_MANAGER}" install -y "${pkg}" 2>&1 | tee -a "${LOG_FILE}"
+            exit_code="${PIPESTATUS[0]}"
+            set -o errexit
+
+            if [[ ${exit_code} -eq 0 ]]; then
+                log_success "Installed: ${pkg}"
+            else
+                log_warning "Failed to install: ${pkg} (exit code: ${exit_code})"
+                failed_packages+=("${pkg}")
+            fi
+        else
+            if "${PACKAGE_MANAGER}" install -y -q "${pkg}" >>"${LOG_FILE}" 2>&1; then
+                log_success "Installed: ${pkg}"
+            else
+                log_warning "Failed to install: ${pkg} (check ${LOG_FILE} for details)"
+                failed_packages+=("${pkg}")
+            fi
+        fi
+    done
+
+    if [[ ${#failed_packages[@]} -gt 0 ]]; then
+        log_warning "Some base packages failed to install: ${failed_packages[*]}"
+        log_info "These are optional utilities - conversion can proceed without them"
+    else
+        log_success "All base packages installed successfully"
+    fi
+}
+
+# Validate GPG key content
+validate_gpg_key() {
+    local key_file="$1"
+
+    if [[ ! -s "${key_file}" ]]; then
+        log_error "GPG key file is empty or does not exist"
+        return 1
+    fi
+
+    if ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "${key_file}"; then
+        log_error "GPG key file missing BEGIN marker"
+        return 1
+    fi
+
+    if ! grep -q "END PGP PUBLIC KEY BLOCK" "${key_file}"; then
+        log_error "GPG key file missing END marker"
+        return 1
+    fi
+
+    return 0
+}
+
+# Install Red Hat GPG key
+install_gpg_key() {
+    local gpg_dir
+    local temp_key
+
+    log_info "Installing Red Hat GPG key..."
+
+    gpg_dir="$(dirname "${GPG_KEY_PATH}")"
+
+    if [[ ! -d "${gpg_dir}" ]]; then
+        if ! mkdir -p "${gpg_dir}"; then
+            die "${EXIT_ERROR}" "Failed to create GPG key directory: ${gpg_dir}"
+        fi
+    fi
+
+    # Download to temp location first
+    temp_key="${TEMP_DIR}/gpg-key"
+    if ! curl -fsSL --max-time 30 -o "${temp_key}" "${GPG_KEY_URL}"; then
+        die "${EXIT_ERROR}" "Failed to download Red Hat GPG key from ${GPG_KEY_URL}"
+    fi
+
+    # Validate downloaded key
+    if ! validate_gpg_key "${temp_key}"; then
+        die "${EXIT_ERROR}" "Downloaded GPG key validation failed"
+    fi
+
+    # Move to final location
+    if ! mv "${temp_key}" "${GPG_KEY_PATH}"; then
+        die "${EXIT_ERROR}" "Failed to install GPG key to ${GPG_KEY_PATH}"
+    fi
+
+    chmod 644 "${GPG_KEY_PATH}"
+    log_success "Red Hat GPG key installed successfully"
+}
+
+# Validate repository file content
+validate_repo_file() {
+    local repo_file="$1"
+
+    if [[ ! -s "${repo_file}" ]]; then
+        log_error "Repository file is empty or does not exist"
+        return 1
+    fi
+
+    # Check if file contains repository definition
+    if ! grep -qE '^\[.*\]' "${repo_file}"; then
+        log_error "Repository file does not contain a section header"
+        return 1
+    fi
+
+    # Check for either baseurl or mirrorlist/metalink
+    if ! grep -qE '^(baseurl|mirrorlist|metalink)=' "${repo_file}"; then
+        log_error "Repository file does not contain baseurl, mirrorlist, or metalink"
+        return 1
+    fi
+
+    return 0
+}
+
+# Install convert2rhel repository configuration
+install_convert2rhel_repo() {
+    local repo_url
+    local repo_file="/etc/yum.repos.d/convert2rhel.repo"
+    local temp_repo
+    local arch
+
+    log_info "Installing convert2rhel repository for RHEL ${RHEL_VERSION}..."
+
+    arch=$(detect_architecture)
+
+    # Determine repository URL based on RHEL version and architecture
+    case "${RHEL_VERSION}" in
+        9)
+            repo_url="https://cdn-public.redhat.com/content/public/repofiles/convert2rhel-for-rhel-9-${arch}.repo"
+            ;;
+        8)
+            repo_url="https://cdn-public.redhat.com/content/public/repofiles/convert2rhel-for-rhel-8-${arch}.repo"
+            ;;
+        7)
+            repo_url="https://cdn-public.redhat.com/content/public/repofiles/convert2rhel-for-rhel-7-${arch}.repo"
+            ;;
+        *)
+            die "${EXIT_ERROR}" "Unsupported RHEL version for repository: ${RHEL_VERSION}"
+            ;;
+    esac
+
+    # Download to temp location
+    temp_repo="${TEMP_DIR}/convert2rhel.repo"
+    if ! curl -fsSL --max-time 30 -o "${temp_repo}" "${repo_url}"; then
+        die "${EXIT_ERROR}" "Failed to download convert2rhel repository from ${repo_url}"
+    fi
+
+    # Validate content
+    if ! validate_repo_file "${temp_repo}"; then
+        log_error "Repository file validation failed. Content preview:"
+        head -n 20 "${temp_repo}" 2>/dev/null | while IFS= read -r line; do
+            log_error "  ${line}"
+        done
+        die "${EXIT_ERROR}" "Downloaded repository file validation failed"
+    fi
+
+    # Backup existing repo if present
+    if [[ -f "${repo_file}" ]]; then
+        local backup
+        backup="${repo_file}.backup.$(date +%Y%m%d-%H%M%S)"
+        if cp "${repo_file}" "${backup}" 2>/dev/null; then
+            log_info "Backed up existing repository to: ${backup}"
+        else
+            log_warning "Failed to backup existing repository file"
+        fi
+    fi
+
+    # Move to final location
+    if ! mv "${temp_repo}" "${repo_file}"; then
+        die "${EXIT_ERROR}" "Failed to install repository file to ${repo_file}"
+    fi
+
+    chmod 644 "${repo_file}"
+    log_success "convert2rhel repository installed successfully"
+}
+
+# Install convert2rhel package
+install_convert2rhel() {
+    local exit_code
+
+    log_info "Installing convert2rhel package..."
+
+    # Clean metadata to ensure fresh repo data
+    log_info "Cleaning package metadata..."
+    if [[ "${VERBOSE}" == true ]]; then
+        if ! "${PACKAGE_MANAGER}" clean metadata 2>&1 | tee -a "${LOG_FILE}"; then
+            log_warning "Failed to clean metadata, continuing..."
+        fi
+    else
+        if ! "${PACKAGE_MANAGER}" clean metadata >>"${LOG_FILE}" 2>&1; then
+            log_warning "Failed to clean metadata, continuing..."
+        fi
+    fi
+
+    # Install package
+    log_info "Installing convert2rhel from repository..."
+    if [[ "${VERBOSE}" == true ]]; then
+        set +o errexit
+        "${PACKAGE_MANAGER}" install -y convert2rhel 2>&1 | tee -a "${LOG_FILE}"
+        exit_code="${PIPESTATUS[0]}"
+        set -o errexit
+
+        if [[ ${exit_code} -ne 0 ]]; then
+            die "${EXIT_ERROR}" "Failed to install convert2rhel package (exit code: ${exit_code})"
+        fi
+    else
+        if ! "${PACKAGE_MANAGER}" install -y convert2rhel >>"${LOG_FILE}" 2>&1; then
+            log_error "Failed to install convert2rhel package"
+            log_error "Check ${LOG_FILE} for detailed error output"
+            die "${EXIT_ERROR}" "convert2rhel installation failed"
+        fi
+    fi
+
+    # Verify binary exists and is executable
+    if ! command_exists convert2rhel; then
+        die "${EXIT_ERROR}" "convert2rhel binary not found after installation"
+    fi
+
+    # Verify we can get version info
+    if ! convert2rhel --version >>"${LOG_FILE}" 2>&1; then
+        log_warning "Cannot get convert2rhel version, but binary exists"
+    fi
+
+    log_success "convert2rhel package installed successfully"
+}
+
+# Configure convert2rhel with credentials
+configure_convert2rhel() {
+    local config_dir
+    local backup_file
+    local temp_config
+    local old_umask
+
+    log_info "Configuring convert2rhel..."
+
+    config_dir="$(dirname "${CONVERT2RHEL_CONFIG}")"
+
+    # Create config directory if needed
+    if [[ ! -d "${config_dir}" ]]; then
+        if ! mkdir -p "${config_dir}"; then
+            die "${EXIT_ERROR}" "Failed to create config directory: ${config_dir}"
+        fi
+    fi
+
+    # Backup existing configuration
+    if [[ -f "${CONVERT2RHEL_CONFIG}" ]]; then
+        backup_file="${CONVERT2RHEL_CONFIG}.backup.$(date +%Y%m%d-%H%M%S)"
+        if cp "${CONVERT2RHEL_CONFIG}" "${backup_file}" 2>/dev/null; then
+            log_info "Existing configuration backed up to: ${backup_file}"
+        else
+            log_warning "Failed to backup existing configuration"
+        fi
+    fi
+
+    # Write configuration to temp file with restrictive umask
+    old_umask=$(umask)
+    umask 077
+
+    temp_config="${TEMP_DIR}/convert2rhel.ini"
+    cat >"${temp_config}" <<EOF
+[subscription_manager]
+org = ${ORG_ID}
+activation_key = ${ACTIVATION_KEY}
+EOF
+
+    umask "${old_umask}"
+
+    # Validate temp config was written
+    if [[ ! -s "${temp_config}" ]]; then
+        die "${EXIT_ERROR}" "Failed to create configuration file content"
+    fi
+
+    # Move to final location
+    if ! mv "${temp_config}" "${CONVERT2RHEL_CONFIG}"; then
+        die "${EXIT_ERROR}" "Failed to write configuration file: ${CONVERT2RHEL_CONFIG}"
+    fi
+
+    # Set secure permissions
+    chmod 600 "${CONVERT2RHEL_CONFIG}"
+
+    log_success "convert2rhel configuration created successfully"
+}
+
+# ============================================================================
+# Conversion Functions
+# ============================================================================
+
+# Run convert2rhel pre-conversion analysis
+run_analysis() {
+    local analysis_log="${LOG_FILE%.log}-analysis.log"
+    local convert2rhel_args=("analyze")
+    local exit_code
+
+    log_info "Running convert2rhel pre-conversion analysis..."
+    log_info "Analysis output will be logged to: ${analysis_log}"
+
+    if ! confirm "This will analyze the system for RHEL conversion. Continue?"; then
+        log_warning "Analysis cancelled by user"
+        return "${EXIT_ANALYSIS_FAILED}"
+    fi
+
+    if [[ "${ASSUME_YES}" == true ]]; then
+        convert2rhel_args+=("-y")
+        log_info "Running in unattended mode (automatic confirmations)"
+    fi
+
+    {
+        printf '\n%s\n' "========================================="
+        printf 'Convert2RHEL Analysis - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'Command: convert2rhel %s\n' "${convert2rhel_args[*]}"
+        printf '%s\n\n' "========================================="
+    } >"${analysis_log}"
+
+    set +o errexit
+    convert2rhel "${convert2rhel_args[@]}" 2>&1 | tee -a "${analysis_log}"
+    exit_code="${PIPESTATUS[0]}"
+    set -o errexit
+
+    {
+        printf '\n%s\n' "========================================="
+        printf 'Analysis completed with exit code: %d\n' "${exit_code}"
+        printf '%s\n' "========================================="
+    } >>"${analysis_log}"
+
+    if [[ ${exit_code} -eq 0 ]]; then
+        log_success "Analysis completed successfully"
+        return 0
+    else
+        log_error "Analysis completed with issues (exit code: ${exit_code})"
+        log_error "Review the analysis output above and the log file: ${analysis_log}"
+        return "${EXIT_ANALYSIS_FAILED}"
+    fi
+}
+
+# Run convert2rhel conversion
+run_conversion() {
+    local conversion_log="${LOG_FILE%.log}-conversion.log"
+    local convert2rhel_args=()
+    local exit_code
+
+    log_warning "========================================="
+    log_warning "CRITICAL: Starting RHEL conversion process"
+    log_warning "This operation will modify your system"
+    log_warning "========================================="
+
+    if ! confirm "Are you absolutely sure you want to proceed with the conversion?"; then
+        log_warning "Conversion cancelled by user"
+        return "${EXIT_CONVERSION_FAILED}"
+    fi
+
+    if [[ "${ASSUME_YES}" == true ]]; then
+        convert2rhel_args+=("-y")
+        log_info "Running in unattended mode (automatic confirmations)"
+    fi
+
+    log_info "Initiating convert2rhel conversion..."
+    log_info "Conversion output will be logged to: ${conversion_log}"
+
+    {
+        printf '\n%s\n' "========================================="
+        printf 'Convert2RHEL Conversion - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'Command: convert2rhel %s\n' "${convert2rhel_args[*]}"
+        printf '%s\n\n' "========================================="
+    } >"${conversion_log}"
+
+    set +o errexit
+    convert2rhel "${convert2rhel_args[@]}" 2>&1 | tee -a "${conversion_log}"
+    exit_code="${PIPESTATUS[0]}"
+    set -o errexit
+
+    {
+        printf '\n%s\n' "========================================="
+        printf 'Conversion completed with exit code: %d\n' "${exit_code}"
+        printf '%s\n' "========================================="
+    } >>"${conversion_log}"
+
+    if [[ ${exit_code} -eq 0 ]]; then
+        log_success "Conversion completed successfully"
+        return 0
+    else
+        log_error "Conversion failed or completed with errors (exit code: ${exit_code})"
+        log_error "Review the conversion output above and the log file: ${conversion_log}"
+        return "${EXIT_CONVERSION_FAILED}"
+    fi
+}
+
+# Install and register Red Hat Insights client
+setup_insights_client() {
+    local exit_code
+
+    log_info "Setting up Red Hat Insights client..."
+
+    if [[ "${VERBOSE}" == true ]]; then
+        set +o errexit
+        "${PACKAGE_MANAGER}" install -y insights-client 2>&1 | tee -a "${LOG_FILE}"
+        exit_code="${PIPESTATUS[0]}"
+        set -o errexit
+
+        if [[ ${exit_code} -ne 0 ]]; then
+            log_warning "Failed to install insights-client package (exit code: ${exit_code})"
+            return 1
+        fi
+    else
+        if ! "${PACKAGE_MANAGER}" install -y insights-client >>"${LOG_FILE}" 2>&1; then
+            log_warning "Failed to install insights-client package (check ${LOG_FILE} for details)"
+            return 1
+        fi
+    fi
+
+    if ! command_exists insights-client; then
+        log_warning "insights-client binary not found after installation"
+        return 1
+    fi
+
+    log_success "Insights client installed successfully"
+
+    log_info "Registering with Red Hat Insights..."
+
+    if insights-client --register >>"${LOG_FILE}" 2>&1; then
+        log_success "Successfully registered with Red Hat Insights"
+        return 0
+    else
+        log_warning "Failed to register with Red Hat Insights"
+        log_info "You can manually register later with: insights-client --register"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Main Execution Flow
+# ============================================================================
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|--org-id)
+                if [[ -z "${2:-}" ]]; then
+                    die "${EXIT_INVALID_ARGS}" "Option $1 requires an argument"
+                fi
+                ORG_ID="$2"
+                shift 2
+                ;;
+            -k|--activation-key)
+                if [[ -z "${2:-}" ]]; then
+                    die "${EXIT_INVALID_ARGS}" "Option $1 requires an argument"
+                fi
+                ACTIVATION_KEY="$2"
+                shift 2
+                ;;
+            -a|--analyze-only)
+                ANALYZE_ONLY=true
+                shift
+                ;;
+            -s|--skip-analysis)
+                SKIP_ANALYSIS=true
+                shift
+                ;;
+            -y|--assume-yes)
+                ASSUME_YES=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --skip-base-packages)
+                SKIP_BASE_PACKAGES=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit "${EXIT_SUCCESS}"
+                ;;
+            *)
+                die "${EXIT_INVALID_ARGS}" "Unknown option: $1 (use -h for help)"
+                ;;
+        esac
+    done
+}
+
+run_preflight_checks() {
+    log_info "Running pre-flight checks..."
+
+    check_required_commands
+    check_root
+    validate_flags
+    detect_package_manager
+    detect_rhel_version
+    validate_parameters
+    check_connectivity
+    check_disk_space
+
+    log_success "All pre-flight checks passed"
+}
+
+run_installation_phase() {
+    log_section_header "Starting installation phase"
+
+    install_base_packages
+    install_gpg_key
+    install_convert2rhel_repo
+    install_convert2rhel
+    configure_convert2rhel
+
+    log_success "Installation phase completed"
+}
+
+run_analysis_phase() {
+    if [[ "${SKIP_ANALYSIS}" == true ]]; then
+        log_warning "========================================="
+        log_warning "Skipping analysis phase as requested"
+        log_warning "Proceeding without pre-conversion analysis"
+        log_warning "USE AT YOUR OWN RISK"
+        log_warning "========================================="
+        return 0
+    fi
+
+    log_section_header "Starting analysis phase"
+
+    if ! run_analysis; then
+        die "${EXIT_ANALYSIS_FAILED}" \
+            "Analysis phase failed - review output above and resolve issues before conversion"
+    fi
+
+    log_success "Analysis phase completed successfully"
+}
+
+run_conversion_phase() {
+    if [[ "${ANALYZE_ONLY}" == true ]]; then
+        log_section_header "Analysis-only mode: Skipping conversion"
+        return 0
+    fi
+
+    log_section_header "Starting conversion phase"
+
+    if ! run_conversion; then
+        die "${EXIT_CONVERSION_FAILED}" \
+            "Conversion phase failed - review output above and contact Red Hat Support if needed"
+    fi
+
+    log_success "Conversion phase completed successfully"
+}
+
+run_postconversion_phase() {
+    if [[ "${ANALYZE_ONLY}" == true ]]; then
+        return 0
+    fi
+
+    log_section_header "Starting post-conversion setup"
+
+    if ! setup_insights_client; then
+        log_warning "Insights client setup had issues, but conversion succeeded"
+    fi
+
+    log_success "Post-conversion setup completed"
+}
+
+main() {
+    local start_time
+    local end_time
+
+    start_time="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Header
+    log_section_header "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    log_info "Started at: ${start_time}"
+
+    # Setup
+    setup_logging
+    setup_temp_directory
+
+    # Execute phases
+    run_preflight_checks
+    run_installation_phase
+    run_analysis_phase
+    run_conversion_phase
+    run_postconversion_phase
+
+    # Footer
+    end_time="$(date '+%Y-%m-%d %H:%M:%S')"
+    log_info "========================================="
+    log_success "Script completed successfully"
+    log_info "Started:  ${start_time}"
+    log_info "Finished: ${end_time}"
+    log_info "Log file: ${LOG_FILE}"
+    log_info "========================================="
+
+    # Reboot prompt for full conversion
+    if [[ "${ANALYZE_ONLY}" == false ]]; then
+        log_warning ""
+        log_warning "========================================="
+        log_warning "System conversion complete"
+        log_warning "A REBOOT IS REQUIRED to boot RHEL kernel"
+        log_warning "========================================="
+
+        if confirm "Would you like to reboot now?"; then
+            log_info "Rebooting system in 5 seconds..."
+            sleep 5
+            sync
+            reboot
+        else
+            log_warning "Please reboot the system manually to complete the conversion"
+            log_warning "Command: reboot"
+        fi
+    fi
+}
+
+# ============================================================================
+# Script Entry Point
+# ============================================================================
+
+parse_arguments "$@"
+main
+
+exit "${EXIT_SUCCESS}"
