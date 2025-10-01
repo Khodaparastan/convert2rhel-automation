@@ -1,4 +1,4 @@
-# Convert2RHEL Setup Script
+# Convert2RHEL Automation
 
 Automated setup and conversion script for migrating compatible Linux distributions to Red Hat Enterprise Linux (RHEL).
 

@@ -1,3 +1,56 @@
-.*
+# Temporary files
+tmp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# Log files
+*.log
+logs/
+conversion-logs/
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+crash.log
+crash.*.log
+# Lock files for examples can be committed for reproducibility
+# but not at root level
+/.terraform.lock.hcl
+
+# Ansible files
+.ansible/
+*.retry
+.vault_pass
+group_vars/*/vault.yml
+
+# Sensitive data
+*credentials*
+*secrets*
+*.pem
+*.key
 !.gitignore
-tmp
+
+# Build artifacts
+dist/
+build/
+*.tar.gz
+*.zip
+
+# Release artifacts
+*.sha256
+release-notes-*.md
+
+# Test files
+test-results/
+coverage/
