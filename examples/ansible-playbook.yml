@@ -1,0 +1,454 @@
+---
+#
+# Convert2RHEL Automation - Ansible Playbook
+#
+# This playbook demonstrates how to use convert2rhel-automation in Ansible
+# to convert multiple servers to RHEL at scale.
+#
+# Requirements:
+#   - Ansible 2.9+
+#   - ansible-vault for storing credentials
+#   - Target hosts with sudo access
+#
+# Usage:
+#   # Create vault for secrets
+#   ansible-vault create group_vars/all/vault.yml
+#
+#   # Run playbook
+#   ansible-playbook -i inventory.ini ansible-playbook.yml --ask-vault-pass
+#
+#   # Run analysis only
+#   ansible-playbook -i inventory.ini ansible-playbook.yml --ask-vault-pass --tags analysis
+#
+#   # Run conversion only (after analysis)
+#   ansible-playbook -i inventory.ini ansible-playbook.yml --ask-vault-pass --tags conversion
+#
+
+- name: Convert CentOS/Oracle Linux systems to RHEL
+  hosts: conversion_targets
+  become: true
+  gather_facts: true
+
+  vars:
+    # Red Hat credentials (store in vault)
+    rh_org_id: "{{ vault_rh_org_id }}"
+    rh_activation_key: "{{ vault_rh_activation_key }}"
+
+    # Script configuration
+    script_url: "https://raw.githubusercontent.com/khodaparastan/convert2rhel-automation/main/convert2rhel-setup"
+    script_local_path: "/tmp/convert2rhel-setup"
+    script_version: "1.2.0"
+
+    # Conversion settings
+    run_analysis: true
+    run_conversion: true
+    auto_reboot: false
+    assume_yes: true
+
+    # Backup settings
+    require_backup_confirmation: true
+
+    # Logging
+    log_dir: "/var/log/ansible-convert2rhel"
+
+  pre_tasks:
+    - name: Display playbook information
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "Convert2RHEL Automation Playbook"
+          - "Version: {{ script_version }}"
+          - "Target: {{ inventory_hostname }}"
+          - "========================================="
+      tags: always
+
+    - name: Verify Ansible version
+      ansible.builtin.assert:
+        that:
+          - ansible_version.full is version('2.9', '>=')
+        fail_msg: "This playbook requires Ansible 2.9 or higher"
+      tags: always
+
+    - name: Check if running as root
+      ansible.builtin.command: id -u
+      register: user_id
+      changed_when: false
+      failed_when: user_id.stdout != "0"
+      tags: always
+
+  tasks:
+    # ============================================================================
+    # Pre-Conversion Checks
+    # ============================================================================
+
+    - name: Pre-conversion checks
+      tags:
+        - always
+        - preflight
+      block:
+        - name: Gather system facts
+          ansible.builtin.setup:
+            gather_subset:
+              - '!all'
+              - '!min'
+              - distribution
+              - distribution_version
+              - mounts
+              - memory
+
+        - name: Display system information
+          ansible.builtin.debug:
+            msg:
+              - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+              - "Memory: {{ ansible_memtotal_mb }} MB"
+              - "Root disk space: {{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | human_readable }}"
+
+        - name: Verify supported OS
+          ansible.builtin.assert:
+            that:
+              - ansible_distribution in ['CentOS', 'OracleLinux', 'AlmaLinux', 'Rocky']
+              - ansible_distribution_major_version in ['7', '8', '9']
+            fail_msg: "Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+        - name: Check disk space (minimum 5 GB required)
+          ansible.builtin.assert:
+            that:
+              - item.size_available > 5368709120  # 5 GB in bytes
+            fail_msg: "Insufficient disk space on {{ item.mount }}: {{ item.size_available | human_readable }} available"
+          loop: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | list }}"
+
+        - name: Check memory (minimum 2 GB recommended)
+          ansible.builtin.debug:
+            msg: "WARNING: Less than 2 GB memory detected ({{ ansible_memtotal_mb }} MB)"
+          when: ansible_memtotal_mb < 2048
+
+        - name: Verify internet connectivity
+          ansible.builtin.uri:
+            url: "https://cdn.redhat.com"
+            method: HEAD
+            timeout: 10
+          register: connectivity_check
+          failed_when: connectivity_check.status != 200
+
+        - name: Confirm backup exists
+          ansible.builtin.pause:
+            prompt: |
+
+              ⚠️  CRITICAL: Backup Confirmation Required
+
+              Before proceeding with conversion, confirm:
+
+              1. Full system backup has been completed
+              2. Backup has been tested and verified
+              3. Rollback procedure is documented
+              4. Maintenance window is scheduled
+
+              Type 'yes' to confirm backup exists and is valid
+          register: backup_confirmation
+          when: require_backup_confirmation
+          failed_when: backup_confirmation.user_input | lower != 'yes'
+
+    # ============================================================================
+    # Script Installation
+    # ============================================================================
+
+    - name: Install conversion script
+      tags:
+        - always
+        - install
+      block:
+        - name: Create log directory
+          ansible.builtin.file:
+            path: "{{ log_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: Download convert2rhel-setup
+          ansible.builtin.get_url:
+            url: "{{ script_url }}"
+            dest: "{{ script_local_path }}"
+            mode: '0755'
+            timeout: 30
+          register: script_download
+
+        - name: Verify script downloaded
+          ansible.builtin.stat:
+            path: "{{ script_local_path }}"
+          register: script_stat
+          failed_when: not script_stat.stat.exists
+
+        - name: Display script info
+          ansible.builtin.debug:
+            msg:
+              - "Script downloaded: {{ script_local_path }}"
+              - "Size: {{ script_stat.stat.size }} bytes"
+              - "Executable: {{ script_stat.stat.executable }}"
+
+    # ============================================================================
+    # Analysis Phase
+    # ============================================================================
+
+    - name: Run pre-conversion analysis
+      when: run_analysis
+      tags:
+        - analysis
+      block:
+        - name: Execute analysis
+          ansible.builtin.command: >
+            {{ script_local_path }}
+            --org-id {{ rh_org_id }}
+            --activation-key {{ rh_activation_key }}
+            --analyze-only
+            {% if assume_yes %}--assume-yes{% endif %}
+          register: analysis_result
+          changed_when: false
+          failed_when: analysis_result.rc not in [0, 4]  # 0=success, 4=analysis issues
+          environment:
+            LOG_FILE: "{{ log_dir }}/convert2rhel-{{ inventory_hostname }}.log"
+
+        - name: Save analysis output
+          ansible.builtin.copy:
+            content: "{{ analysis_result.stdout }}"
+            dest: "{{ log_dir }}/analysis-{{ inventory_hostname }}-{{ ansible_date_time.iso8601_basic_short }}.log"
+            mode: '0644'
+
+        - name: Display analysis summary
+          ansible.builtin.debug:
+            msg:
+              - "========================================="
+              - "Analysis Results for {{ inventory_hostname }}"
+              - "========================================="
+              - "{{ analysis_result.stdout_lines | select('search', '(ERROR|WARNING|SUCCESS|FAILED)') | list }}"
+              - "========================================="
+
+        - name: Check for analysis failures
+          ansible.builtin.assert:
+            that:
+              - analysis_result.rc == 0
+            fail_msg: |
+              Analysis found blocking issues on {{ inventory_hostname }}.
+              Review the analysis log at {{ log_dir }}/analysis-{{ inventory_hostname }}-{{ ansible_date_time.iso8601_basic_short }}.log
+              Exit code: {{ analysis_result.rc }}
+          when: run_conversion
+
+        - name: Analysis passed
+          ansible.builtin.debug:
+            msg: "✅ Analysis passed successfully for {{ inventory_hostname }}"
+          when: analysis_result.rc == 0
+
+    # ============================================================================
+    # Conversion Phase
+    # ============================================================================
+
+    - name: Run RHEL conversion
+      when: run_conversion
+      tags:
+        - conversion
+      block:
+        - name: Final conversion confirmation
+          ansible.builtin.pause:
+            prompt: |
+
+              ⚠️  CRITICAL: Final Conversion Confirmation
+
+              You are about to convert {{ inventory_hostname }} to RHEL.
+              This operation is IRREVERSIBLE.
+
+              System: {{ ansible_distribution }} {{ ansible_distribution_version }}
+              Hostname: {{ inventory_hostname }}
+
+              Type 'CONVERT' (all caps) to proceed
+          register: conversion_confirmation
+          when: not assume_yes
+          failed_when: conversion_confirmation.user_input != 'CONVERT'
+
+        - name: Execute conversion
+          ansible.builtin.command: >
+            {{ script_local_path }}
+            --org-id {{ rh_org_id }}
+            --activation-key {{ rh_activation_key }}
+            {% if assume_yes %}--assume-yes{% endif %}
+          register: conversion_result
+          changed_when: conversion_result.rc == 0
+          failed_when: conversion_result.rc not in [0]
+          async: 7200  # 2 hours timeout
+          poll: 30     # Check every 30 seconds
+          environment:
+            LOG_FILE: "{{ log_dir }}/convert2rhel-{{ inventory_hostname }}.log"
+
+        - name: Save conversion output
+          ansible.builtin.copy:
+            content: "{{ conversion_result.stdout }}"
+            dest: "{{ log_dir }}/conversion-{{ inventory_hostname }}-{{ ansible_date_time.iso8601_basic_short }}.log"
+            mode: '0644'
+
+        - name: Display conversion summary
+          ansible.builtin.debug:
+            msg:
+              - "========================================="
+              - "Conversion Results for {{ inventory_hostname }}"
+              - "========================================="
+              - "{{ conversion_result.stdout_lines | select('search', '(ERROR|WARNING|SUCCESS|FAILED)') | list }}"
+              - "========================================="
+
+        - name: Conversion completed
+          ansible.builtin.debug:
+            msg: "✅ Conversion completed successfully for {{ inventory_hostname }}"
+          when: conversion_result.rc == 0
+
+    # ============================================================================
+    # Post-Conversion
+    # ============================================================================
+
+    - name: Post-conversion tasks
+      when:
+        - run_conversion
+        - conversion_result.rc == 0
+      tags:
+        - conversion
+        - post-conversion
+      block:
+        - name: Wait for system stability
+          ansible.builtin.pause:
+            seconds: 10
+
+        - name: Gather post-conversion facts
+          ansible.builtin.setup:
+            gather_subset:
+              - '!all'
+              - '!min'
+              - distribution
+
+        - name: Create reboot marker
+          ansible.builtin.copy:
+            content: |
+              System converted to RHEL on {{ ansible_date_time.iso8601 }}
+              Previous OS: {{ ansible_distribution }}
+              Converted by: Ansible playbook
+              Reboot required: YES
+            dest: /root/REBOOT_REQUIRED_FOR_RHEL
+            mode: '0644'
+
+        - name: Display reboot requirement
+          ansible.builtin.debug:
+            msg:
+              - "========================================="
+              - "⚠️  REBOOT REQUIRED"
+              - "========================================="
+              - "The system has been converted to RHEL."
+              - "A reboot is required to boot the RHEL kernel."
+              - ""
+              - "Reboot manually with:"
+              - "  ansible {{ inventory_hostname }} -b -m reboot"
+              - "========================================="
+
+    # ============================================================================
+    # Reboot (Optional)
+    # ============================================================================
+
+    - name: Reboot system
+      when:
+        - auto_reboot
+        - run_conversion
+        - conversion_result.rc == 0
+      tags:
+        - reboot
+      block:
+        - name: Reboot confirmation
+          ansible.builtin.pause:
+            prompt: |
+
+              System is ready to reboot.
+              Type 'yes' to reboot {{ inventory_hostname }} now
+          register: reboot_confirmation
+          when: not assume_yes
+          failed_when: reboot_confirmation.user_input | lower != 'yes'
+
+        - name: Reboot the system
+          ansible.builtin.reboot:
+            msg: "Rebooting after RHEL conversion"
+            reboot_timeout: 600
+            pre_reboot_delay: 5
+            post_reboot_delay: 30
+            test_command: uptime
+
+        - name: Wait for system to come back
+          ansible.builtin.wait_for_connection:
+            delay: 30
+            timeout: 600
+
+        - name: Verify system is responsive
+          ansible.builtin.ping:
+
+  # ============================================================================
+  # Post-Tasks (Validation)
+  # ============================================================================
+
+  post_tasks:
+    - name: Post-conversion validation
+      when:
+        - run_conversion
+        - auto_reboot
+      tags:
+        - validation
+      block:
+        - name: Wait for system to stabilize
+          ansible.builtin.pause:
+            seconds: 30
+
+        - name: Gather updated facts
+          ansible.builtin.setup:
+
+        - name: Verify RHEL conversion
+          ansible.builtin.shell: |
+            cat /etc/redhat-release
+            subscription-manager status
+            uname -r
+          register: verification
+          changed_when: false
+
+        - name: Display verification results
+          ansible.builtin.debug:
+            msg:
+              - "========================================="
+              - "Post-Conversion Verification"
+              - "========================================="
+              - "{{ verification.stdout_lines }}"
+              - "========================================="
+
+        - name: Check for Red Hat release
+          ansible.builtin.assert:
+            that:
+              - "'Red Hat Enterprise Linux' in verification.stdout"
+            success_msg: "✅ Successfully converted to RHEL"
+            fail_msg: "❌ Conversion verification failed"
+
+  handlers:
+    - name: Archive logs
+      community.general.archive:
+        path: "{{ log_dir }}/*.log"
+        dest: "{{ log_dir }}/conversion-logs-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+        remove: false
+        mode: '0644'
+
+# ============================================================================
+# Example Inventory File (inventory.ini)
+# ============================================================================
+#
+# [conversion_targets]
+# centos-server-01 ansible_host=192.168.1.10 ansible_user=root
+# centos-server-02 ansible_host=192.168.1.11 ansible_user=root
+# oracle-server-01 ansible_host=192.168.1.20 ansible_user=root
+#
+# [conversion_targets:vars]
+# ansible_ssh_private_key_file=~/.ssh/id_rsa
+# ansible_python_interpreter=/usr/bin/python3
+#
+# ============================================================================
+# Example Vault File (group_vars/all/vault.yml)
+# ============================================================================
+#
+# Create with: ansible-vault create group_vars/all/vault.yml
+#
+# vault_rh_org_id: "1234567"
+# vault_rh_activation_key: "my-activation-key"
