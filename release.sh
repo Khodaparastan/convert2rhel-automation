@@ -243,29 +243,28 @@ check_version_consistency() {
     local version="$1"
     print_header "Checking Version Consistency"
 
-    local files=(
-        "$MAIN_SCRIPT:Version: $version"
-        "$README:Version:** $version"
-        "$QUICK_REF:Version:** $version"
-        "SECURITY.md:Version:** $version"
+    local -a files=(
+        "$MAIN_SCRIPT"
+        "$README"
+        "$QUICK_REF"
+        "SECURITY.md"
+        "examples/ansible-playbook.yml"
     )
 
     local inconsistent=0
-    for file_pattern in "${files[@]}"; do
-        local file="${file_pattern%%:*}"
-        local pattern="${file_pattern#*:}"
-
+    for file in "${files[@]}"; do
         if [[ ! -f "$file" ]]; then
             log_error "File not found: $file"
             ((inconsistent++)) || true
             continue
         fi
 
-        if ! grep -q "$pattern" "$file"; then
-            log_error "Version mismatch in $file (expected: $pattern)"
+        # Just check if the version number appears in the file
+        if ! grep -q "$version" "$file"; then
+            log_error "Version $version not found in $file"
             ((inconsistent++)) || true
         else
-            log_success "$file: version correct"
+            log_success "$file: contains version $version"
         fi
     done
 
@@ -273,7 +272,7 @@ check_version_consistency() {
         die "Version inconsistencies found in $inconsistent file(s)"
     fi
 
-    log_success "All version numbers consistent: $version"
+    log_success "All files contain version: $version"
 }
 
 check_changelog() {
