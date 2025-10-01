@@ -37,7 +37,7 @@
     # Script configuration
     script_url: "https://raw.githubusercontent.com/khodaparastan/convert2rhel-automation/main/convert2rhel-setup"
     script_local_path: "/tmp/convert2rhel-setup"
-    script_version: "1.2.0"
+    script_version: "1.3.0"
 
     # Conversion settings
     run_analysis: true
